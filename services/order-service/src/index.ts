@@ -7,6 +7,7 @@ import { eq } from "drizzle-orm";
 import { publishEvent } from "./events";
 import { releaseInventory, reserveInventory } from "./inventory";
 import { monitoring, recordOrderCreated, recordOrderFailed } from "./metrics";
+import { logError, logInfo, logWarn } from "./logger";
 
 const CATALOG_SERVICE_URL =
   process.env.CATALOG_SERVICE_URL || "http://localhost:3001";
@@ -58,9 +59,17 @@ function serializeOrder(order: typeof orders.$inferSelect) {
   };
 }
 
+const requestStarts = new WeakMap<Request, number>();
+const requestIds = new WeakMap<Request, string>();
+
 const app = new Elysia()
   .onRequest(({ request }) => {
     const pathname = new URL(request.url).pathname;
+    requestStarts.set(request, performance.now());
+    requestIds.set(
+      request,
+      request.headers.get("x-request-id") || crypto.randomUUID(),
+    );
     if (pathname !== "/metrics") {
       monitoring.markRequestStart(request);
     }
@@ -68,23 +77,54 @@ const app = new Elysia()
   .onAfterHandle(({ request, path, set }) => {
     const route = path || new URL(request.url).pathname;
     if (route === "/metrics") return;
+    const requestId = requestIds.get(request);
+    const durationMs = Math.max(
+      performance.now() - (requestStarts.get(request) ?? performance.now()),
+      0,
+    );
+    const statusCode = typeof set.status === "number" ? set.status : 200;
+
+    logInfo("http.request.completed", {
+      request_id: requestId,
+      method: request.method,
+      route,
+      path: new URL(request.url).pathname,
+      status_code: statusCode,
+      duration_ms: Number(durationMs.toFixed(2)),
+    });
 
     monitoring.recordHttpRequest({
       request,
       method: request.method,
       route,
-      statusCode: typeof set.status === "number" ? set.status : 200,
+      statusCode,
     });
   })
-  .onError(({ request, path, set }) => {
+  .onError(({ request, path, set, error }) => {
     const route = path || new URL(request.url).pathname;
     if (route === "/metrics") return;
+    const requestId = requestIds.get(request);
+    const statusCode = typeof set.status === "number" ? set.status : 500;
+    const durationMs = Math.max(
+      performance.now() - (requestStarts.get(request) ?? performance.now()),
+      0,
+    );
+
+    logError("http.request.failed", {
+      request_id: requestId,
+      method: request.method,
+      route,
+      path: new URL(request.url).pathname,
+      status_code: statusCode,
+      duration_ms: Number(durationMs.toFixed(2)),
+      error: error instanceof Error ? error.message : String(error),
+    });
 
     monitoring.recordHttpRequest({
       request,
       method: request.method,
       route,
-      statusCode: typeof set.status === "number" ? set.status : 500,
+      statusCode,
     });
   })
   .use(cors())
@@ -103,13 +143,24 @@ const app = new Elysia()
   )
   .post(
     "/api/orders",
-    async ({ body, status }) => {
+    async ({ body, status, request }) => {
+      const requestId = requestIds.get(request) || crypto.randomUUID();
       const lensResponse = await fetch(
         `${CATALOG_SERVICE_URL}/api/lenses/${body.lensId}`,
+        {
+          headers: {
+            "x-request-id": requestId,
+          },
+        },
       );
 
       if (!lensResponse.ok) {
         recordOrderFailed("lens_not_found");
+        logWarn("order.create_failed", {
+          request_id: requestId,
+          reason: "lens_not_found",
+          lens_id: body.lensId,
+        });
         return status(404, { error: "Lens not found" });
       }
 
@@ -123,6 +174,11 @@ const app = new Elysia()
 
       if (days <= 0) {
         recordOrderFailed("invalid_date_range");
+        logWarn("order.create_failed", {
+          request_id: requestId,
+          reason: "invalid_date_range",
+          lens_id: body.lensId,
+        });
         return status(400, { error: "End date must be after start date" });
       }
 
@@ -136,10 +192,17 @@ const app = new Elysia()
         lensId: body.lensId,
         branchCode,
         quantity,
-      });
+      }, requestId);
 
       if (!reservation.ok) {
         recordOrderFailed(`inventory_${reservation.status}`);
+        logWarn("order.create_failed", {
+          request_id: requestId,
+          reason: `inventory_${reservation.status}`,
+          order_id: orderId,
+          lens_id: body.lensId,
+          branch_code: branchCode,
+        });
         return status(reservation.status, { error: reservation.error });
       }
 
@@ -165,7 +228,12 @@ const app = new Elysia()
 
       if (!order) {
         recordOrderFailed("database_insert_failed");
-        await releaseInventory(orderId);
+        await releaseInventory(orderId, requestId);
+        logError("order.create_failed", {
+          request_id: requestId,
+          reason: "database_insert_failed",
+          order_id: orderId,
+        });
         return status(500, { error: "Failed to create order" });
       }
 
@@ -176,9 +244,16 @@ const app = new Elysia()
         lensName: lens.modelName,
         branchCode,
         quantity,
-      });
+      }, requestId);
 
       recordOrderCreated(branchCode);
+      logInfo("order.created", {
+        request_id: requestId,
+        order_id: order.id,
+        lens_id: body.lensId,
+        branch_code: branchCode,
+        customer_email: body.customerEmail,
+      });
       return status(201, serializeOrder(order));
     },
     {
@@ -273,4 +348,4 @@ const app = new Elysia()
   })
   .listen(3002);
 
-console.log(`Order Service running on port ${app.server?.port}`);
+logInfo("service.started", { port: app.server?.port });

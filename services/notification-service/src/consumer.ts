@@ -2,6 +2,7 @@ import amqplib from "amqplib";
 import { db } from "./db";
 import { notifications } from "./db/schema";
 import { broadcastNotification } from "./realtime";
+import { logError, logInfo, logWarn } from "./logger";
 
 const RABBITMQ_URL =
   process.env.RABBITMQ_URL || "amqp://guest:guest@localhost:5672";
@@ -22,14 +23,23 @@ export async function startConsumer() {
       await channel.assertQueue(QUEUE_NAME, { durable: true });
       await channel.bindQueue(QUEUE_NAME, EXCHANGE_NAME, "order.*");
 
-      console.log(`Notification Service listening on queue: ${QUEUE_NAME}`);
+      logInfo("consumer.connected", {
+        queue: QUEUE_NAME,
+        exchange: EXCHANGE_NAME,
+      });
 
       channel.consume(QUEUE_NAME, async (msg) => {
         if (!msg) return;
 
         try {
           const event = JSON.parse(msg.content.toString());
-          console.log(`Received event: ${event.event}`, event.data);
+          const correlationId = event.correlationId ?? null;
+
+          logInfo("event.received", {
+            event_name: event.event,
+            correlation_id: correlationId,
+            order_id: event.data?.orderId,
+          });
 
           if (event.event === "order.placed") {
             const { orderId, customerName, customerEmail, lensName } =
@@ -67,13 +77,19 @@ export async function startConsumer() {
                 },
               });
 
-              console.log(`Notification recorded for order ${orderId}`);
+              logInfo("notification.recorded", {
+                correlation_id: correlationId,
+                order_id: orderId,
+                recipient: customerEmail,
+              });
             }
           }
 
           channel.ack(msg);
         } catch (error) {
-          console.error("Error processing message:", error);
+          logError("event.processing_failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
           channel.nack(msg, false, true);
         }
       });
@@ -81,17 +97,18 @@ export async function startConsumer() {
       return;
     } catch (error) {
       retries++;
-      console.warn(
-        `Failed to connect to RabbitMQ (attempt ${retries}/${maxRetries}):`,
-        (error as Error).message,
-      );
+      logWarn("consumer.connection_retry", {
+        attempt: retries,
+        max_retries: maxRetries,
+        error: (error as Error).message,
+      });
       if (retries < maxRetries) {
         await new Promise((resolve) => setTimeout(resolve, retryDelay));
       }
     }
   }
 
-  console.error(
-    "Failed to connect to RabbitMQ after maximum retries. Continuing without consumer.",
-  );
+  logError("consumer.connection_failed", {
+    max_retries: maxRetries,
+  });
 }

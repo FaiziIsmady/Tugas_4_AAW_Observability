@@ -1,3 +1,5 @@
+import { logError } from "./logger";
+
 const clients = new Set<any>();
 
 export interface NotificationBroadcastPayload {
@@ -33,7 +35,9 @@ export function broadcastNotification(payload: NotificationBroadcastPayload) {
     try {
       client.send(serialized);
     } catch (error) {
-      console.error("Failed to deliver WebSocket notification:", error);
+      logError("websocket.delivery_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
       clients.delete(client);
     }
   }

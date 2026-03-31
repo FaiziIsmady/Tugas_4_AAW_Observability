@@ -1,0 +1,23 @@
+filebeat.inputs:
+  - type: filestream
+    id: suilens-docker-containers
+    enabled: true
+    paths:
+      - /var/lib/docker/containers/*/*.log
+    parsers:
+      - container:
+          stream: all
+          format: docker
+
+processors:
+  - add_docker_metadata:
+      host: "unix:///var/run/docker.sock"
+
+setup.ilm.enabled: false
+
+output.logstash:
+  hosts:
+    - logstash:5044
+
+logging.json: true
+logging.metrics.enabled: false

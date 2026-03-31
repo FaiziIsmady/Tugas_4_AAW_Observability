@@ -5,6 +5,7 @@ import { and, eq } from "drizzle-orm";
 import { db } from "./db";
 import { branches, inventory, reservations } from "./db/schema";
 import { monitoring } from "./metrics";
+import { logError, logInfo } from "./logger";
 
 const branchResponse = t.Object({
   code: t.String(),
@@ -42,9 +43,17 @@ const errorResponse = t.Object({
   error: t.String(),
 });
 
+const requestStarts = new WeakMap<Request, number>();
+const requestIds = new WeakMap<Request, string>();
+
 const app = new Elysia()
   .onRequest(({ request }) => {
     const pathname = new URL(request.url).pathname;
+    requestStarts.set(request, performance.now());
+    requestIds.set(
+      request,
+      request.headers.get("x-request-id") || crypto.randomUUID(),
+    );
     if (pathname !== "/metrics") {
       monitoring.markRequestStart(request);
     }
@@ -52,23 +61,54 @@ const app = new Elysia()
   .onAfterHandle(({ request, path, set }) => {
     const route = path || new URL(request.url).pathname;
     if (route === "/metrics") return;
+    const requestId = requestIds.get(request);
+    const durationMs = Math.max(
+      performance.now() - (requestStarts.get(request) ?? performance.now()),
+      0,
+    );
+    const statusCode = typeof set.status === "number" ? set.status : 200;
+
+    logInfo("http.request.completed", {
+      request_id: requestId,
+      method: request.method,
+      route,
+      path: new URL(request.url).pathname,
+      status_code: statusCode,
+      duration_ms: Number(durationMs.toFixed(2)),
+    });
 
     monitoring.recordHttpRequest({
       request,
       method: request.method,
       route,
-      statusCode: typeof set.status === "number" ? set.status : 200,
+      statusCode,
     });
   })
-  .onError(({ request, path, set }) => {
+  .onError(({ request, path, set, error }) => {
     const route = path || new URL(request.url).pathname;
     if (route === "/metrics") return;
+    const requestId = requestIds.get(request);
+    const statusCode = typeof set.status === "number" ? set.status : 500;
+    const durationMs = Math.max(
+      performance.now() - (requestStarts.get(request) ?? performance.now()),
+      0,
+    );
+
+    logError("http.request.failed", {
+      request_id: requestId,
+      method: request.method,
+      route,
+      path: new URL(request.url).pathname,
+      status_code: statusCode,
+      duration_ms: Number(durationMs.toFixed(2)),
+      error: error instanceof Error ? error.message : String(error),
+    });
 
     monitoring.recordHttpRequest({
       request,
       method: request.method,
       route,
-      statusCode: typeof set.status === "number" ? set.status : 500,
+      statusCode,
     });
   })
   .use(cors())
@@ -134,7 +174,8 @@ const app = new Elysia()
   )
   .post(
     "/api/inventory/reserve",
-    async ({ body, status }) => {
+    async ({ body, status, request }) => {
+      const requestId = requestIds.get(request) || crypto.randomUUID();
       const existingReservation = await db
         .select()
         .from(reservations)
@@ -162,6 +203,13 @@ const app = new Elysia()
       }
 
       if (existingReservation[0]) {
+        logInfo("inventory.reserve_rejected", {
+          request_id: requestId,
+          order_id: body.orderId,
+          lens_id: body.lensId,
+          branch_code: body.branchCode,
+          reason: "reservation_exists",
+        });
         return status(409, {
           error: "Inventory reservation already exists for this order",
         });
@@ -181,10 +229,24 @@ const app = new Elysia()
         const stock = stockRows[0];
 
         if (!stock) {
+          logInfo("inventory.reserve_rejected", {
+            request_id: requestId,
+            order_id: body.orderId,
+            lens_id: body.lensId,
+            branch_code: body.branchCode,
+            reason: "inventory_not_found",
+          });
           return status(404, { error: "Inventory record not found" });
         }
 
         if (stock.availableQuantity < body.quantity) {
+          logInfo("inventory.reserve_rejected", {
+            request_id: requestId,
+            order_id: body.orderId,
+            lens_id: body.lensId,
+            branch_code: body.branchCode,
+            reason: "insufficient_stock",
+          });
           return status(409, {
             error: "Selected branch does not have enough stock",
           });
@@ -203,6 +265,15 @@ const app = new Elysia()
           lensId: body.lensId,
           branchCode: body.branchCode,
           quantity: body.quantity,
+        });
+
+        logInfo("inventory.reserved", {
+          request_id: requestId,
+          order_id: body.orderId,
+          lens_id: body.lensId,
+          branch_code: body.branchCode,
+          quantity: body.quantity,
+          available_quantity: updatedStock?.availableQuantity ?? 0,
         });
 
         return {
@@ -235,8 +306,9 @@ const app = new Elysia()
   )
   .post(
     "/api/inventory/release",
-    async ({ body }) =>
+    async ({ body, request }) =>
       db.transaction(async (tx) => {
+        const requestId = requestIds.get(request) || crypto.randomUUID();
         const reservationRows = await tx
           .select()
           .from(reservations)
@@ -245,6 +317,10 @@ const app = new Elysia()
         const reservation = reservationRows[0];
 
         if (!reservation || reservation.status === "released") {
+          logInfo("inventory.release_skipped", {
+            request_id: requestId,
+            order_id: body.orderId,
+          });
           return {
             success: true,
             orderId: body.orderId,
@@ -280,6 +356,14 @@ const app = new Elysia()
             releasedAt: new Date(),
           })
           .where(eq(reservations.id, reservation.id));
+
+        logInfo("inventory.released", {
+          request_id: requestId,
+          order_id: body.orderId,
+          lens_id: reservation.lensId,
+          branch_code: reservation.branchCode,
+          quantity: reservation.quantity,
+        });
 
         return {
           success: true,
@@ -324,4 +408,4 @@ const app = new Elysia()
   })
   .listen(3004);
 
-console.log(`Inventory Service running on port ${app.server?.port}`);
+logInfo("service.started", { port: app.server?.port });

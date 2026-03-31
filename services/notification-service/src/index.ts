@@ -7,6 +7,7 @@ import { notifications } from "./db/schema";
 import { desc } from "drizzle-orm";
 import { addClient, removeClient } from "./realtime";
 import { monitoring } from "./metrics";
+import { logError, logInfo } from "./logger";
 
 const notificationPayload = t.Object({
   orderId: t.String({ format: "uuid" }),
@@ -42,9 +43,17 @@ function serializeNotification(notification: typeof notifications.$inferSelect) 
   };
 }
 
+const requestStarts = new WeakMap<Request, number>();
+const requestIds = new WeakMap<Request, string>();
+
 const app = new Elysia()
   .onRequest(({ request }) => {
     const pathname = new URL(request.url).pathname;
+    requestStarts.set(request, performance.now());
+    requestIds.set(
+      request,
+      request.headers.get("x-request-id") || crypto.randomUUID(),
+    );
     if (pathname !== "/metrics") {
       monitoring.markRequestStart(request);
     }
@@ -52,23 +61,54 @@ const app = new Elysia()
   .onAfterHandle(({ request, path, set }) => {
     const route = path || new URL(request.url).pathname;
     if (route === "/metrics") return;
+    const requestId = requestIds.get(request);
+    const durationMs = Math.max(
+      performance.now() - (requestStarts.get(request) ?? performance.now()),
+      0,
+    );
+    const statusCode = typeof set.status === "number" ? set.status : 200;
+
+    logInfo("http.request.completed", {
+      request_id: requestId,
+      method: request.method,
+      route,
+      path: new URL(request.url).pathname,
+      status_code: statusCode,
+      duration_ms: Number(durationMs.toFixed(2)),
+    });
 
     monitoring.recordHttpRequest({
       request,
       method: request.method,
       route,
-      statusCode: typeof set.status === "number" ? set.status : 200,
+      statusCode,
     });
   })
-  .onError(({ request, path, set }) => {
+  .onError(({ request, path, set, error }) => {
     const route = path || new URL(request.url).pathname;
     if (route === "/metrics") return;
+    const requestId = requestIds.get(request);
+    const statusCode = typeof set.status === "number" ? set.status : 500;
+    const durationMs = Math.max(
+      performance.now() - (requestStarts.get(request) ?? performance.now()),
+      0,
+    );
+
+    logError("http.request.failed", {
+      request_id: requestId,
+      method: request.method,
+      route,
+      path: new URL(request.url).pathname,
+      status_code: statusCode,
+      duration_ms: Number(durationMs.toFixed(2)),
+      error: error instanceof Error ? error.message : String(error),
+    });
 
     monitoring.recordHttpRequest({
       request,
       method: request.method,
       route,
-      statusCode: typeof set.status === "number" ? set.status : 500,
+      statusCode,
     });
   })
   .use(cors())
@@ -113,6 +153,7 @@ const app = new Elysia()
   .ws("/ws/notifications", {
     open(ws) {
       addClient(ws);
+      logInfo("websocket.connected");
       ws.send(
         JSON.stringify({
           type: "realtime.connected",
@@ -122,6 +163,7 @@ const app = new Elysia()
     },
     close(ws) {
       removeClient(ws);
+      logInfo("websocket.disconnected");
     },
     detail: {
       tags: ["Realtime"],
@@ -156,4 +198,4 @@ const app = new Elysia()
 
 startConsumer().catch(console.error);
 
-console.log(`Notification Service running on port ${app.server?.port}`);
+logInfo("service.started", { port: app.server?.port });
