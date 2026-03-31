@@ -5,6 +5,7 @@ import { db } from "./db";
 import { lenses } from "./db/schema";
 import { eq } from "drizzle-orm";
 import { monitoring } from "./metrics";
+import { recordException, setHttpStatus, startServerSpan, withContext } from "./tracing";
 
 const lensResponse = t.Object({
   id: t.String({ format: "uuid" }),
@@ -94,17 +95,35 @@ const app = new Elysia()
   )
   .get(
     "/api/lenses/:id",
-    async ({ params, status }) => {
-      const results = await db
-        .select()
-        .from(lenses)
-        .where(eq(lenses.id, params.id));
+    async ({ params, status, request }) => {
+      const { span, ctx } = startServerSpan(request, "GET /api/lenses/:id", {
+        "http.method": "GET",
+        "http.route": "/api/lenses/:id",
+        "lens.id": params.id,
+      });
 
-      if (!results[0]) {
-        return status(404, { error: "Lens not found" });
-      }
+      return await withContext(ctx, async () => {
+        try {
+          const results = await db
+            .select()
+            .from(lenses)
+            .where(eq(lenses.id, params.id));
 
-      return serializeLens(results[0]);
+          if (!results[0]) {
+            setHttpStatus(span, 404);
+            return status(404, { error: "Lens not found" });
+          }
+
+          setHttpStatus(span, 200);
+          return serializeLens(results[0]);
+        } catch (error) {
+          setHttpStatus(span, 500);
+          recordException(span, error);
+          throw error;
+        } finally {
+          span.end();
+        }
+      });
     },
     {
       detail: {

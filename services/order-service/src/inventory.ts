@@ -1,3 +1,6 @@
+import { SpanKind } from "@opentelemetry/api";
+import { injectTraceHeaders, setHttpStatus, withActiveSpan } from "./tracing";
+
 const INVENTORY_SERVICE_URL =
   process.env.INVENTORY_SERVICE_URL || "http://localhost:3004";
 
@@ -18,17 +21,35 @@ export async function reserveInventory(
 ): Promise<
   { ok: true } | { ok: false; status: 404 | 409 | 500; error: string }
 > {
-  const response = await fetch(
-    `${INVENTORY_SERVICE_URL}/api/inventory/reserve`,
+  const response = await withActiveSpan(
+    "inventory-service POST /api/inventory/reserve",
     {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(requestId ? { "x-request-id": requestId } : {}),
+      kind: SpanKind.CLIENT,
+      attributes: {
+        "http.method": "POST",
+        "http.url": `${INVENTORY_SERVICE_URL}/api/inventory/reserve`,
       },
-      body: JSON.stringify(payload),
     },
-  ).catch(() => null);
+    async (span) => {
+      const result = await fetch(
+        `${INVENTORY_SERVICE_URL}/api/inventory/reserve`,
+        {
+          method: "POST",
+          headers: injectTraceHeaders({
+            "Content-Type": "application/json",
+            ...(requestId ? { "x-request-id": requestId } : {}),
+          }),
+          body: JSON.stringify(payload),
+        },
+      ).catch(() => null);
+
+      if (result) {
+        setHttpStatus(span, result.status);
+      }
+
+      return result;
+    },
+  );
 
   if (!response) {
     return {
@@ -54,12 +75,28 @@ export async function reserveInventory(
 }
 
 export async function releaseInventory(orderId: string, requestId?: string) {
-  await fetch(`${INVENTORY_SERVICE_URL}/api/inventory/release`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(requestId ? { "x-request-id": requestId } : {}),
+  await withActiveSpan(
+    "inventory-service POST /api/inventory/release",
+    {
+      kind: SpanKind.CLIENT,
+      attributes: {
+        "http.method": "POST",
+        "http.url": `${INVENTORY_SERVICE_URL}/api/inventory/release`,
+      },
     },
-    body: JSON.stringify({ orderId }),
-  }).catch(() => null);
+    async (span) => {
+      const response = await fetch(`${INVENTORY_SERVICE_URL}/api/inventory/release`, {
+        method: "POST",
+        headers: injectTraceHeaders({
+          "Content-Type": "application/json",
+          ...(requestId ? { "x-request-id": requestId } : {}),
+        }),
+        body: JSON.stringify({ orderId }),
+      }).catch(() => null);
+
+      if (response) {
+        setHttpStatus(span, response.status);
+      }
+    },
+  );
 }

@@ -6,6 +6,7 @@ import { db } from "./db";
 import { branches, inventory, reservations } from "./db/schema";
 import { monitoring } from "./metrics";
 import { logError, logInfo } from "./logger";
+import { recordException, setHttpStatus, startServerSpan, withContext } from "./tracing";
 
 const branchResponse = t.Object({
   code: t.String(),
@@ -176,114 +177,137 @@ const app = new Elysia()
     "/api/inventory/reserve",
     async ({ body, status, request }) => {
       const requestId = requestIds.get(request) || crypto.randomUUID();
-      const existingReservation = await db
-        .select()
-        .from(reservations)
-        .where(eq(reservations.orderId, body.orderId));
+      const { span, ctx } = startServerSpan(request, "POST /api/inventory/reserve", {
+        "http.method": "POST",
+        "http.route": "/api/inventory/reserve",
+        "app.request_id": requestId,
+      });
 
-      if (existingReservation[0]?.status === "active") {
-        const existingInventory = await db
-          .select()
-          .from(inventory)
-          .where(
-            and(
-              eq(inventory.lensId, body.lensId),
-              eq(inventory.branchCode, body.branchCode),
-            ),
-          );
+      return await withContext(ctx, async () => {
+        try {
+          const existingReservation = await db
+            .select()
+            .from(reservations)
+            .where(eq(reservations.orderId, body.orderId));
 
-        return {
-          success: true,
-          orderId: body.orderId,
-          lensId: body.lensId,
-          branchCode: body.branchCode,
-          quantity: body.quantity,
-          availableQuantity: existingInventory[0]?.availableQuantity ?? 0,
-        };
-      }
+          if (existingReservation[0]?.status === "active") {
+            const existingInventory = await db
+              .select()
+              .from(inventory)
+              .where(
+                and(
+                  eq(inventory.lensId, body.lensId),
+                  eq(inventory.branchCode, body.branchCode),
+                ),
+              );
 
-      if (existingReservation[0]) {
-        logInfo("inventory.reserve_rejected", {
-          request_id: requestId,
-          order_id: body.orderId,
-          lens_id: body.lensId,
-          branch_code: body.branchCode,
-          reason: "reservation_exists",
-        });
-        return status(409, {
-          error: "Inventory reservation already exists for this order",
-        });
-      }
+            setHttpStatus(span, 200);
+            return {
+              success: true,
+              orderId: body.orderId,
+              lensId: body.lensId,
+              branchCode: body.branchCode,
+              quantity: body.quantity,
+              availableQuantity: existingInventory[0]?.availableQuantity ?? 0,
+            };
+          }
 
-      return db.transaction(async (tx) => {
-        const stockRows = await tx
-          .select()
-          .from(inventory)
-          .where(
-            and(
-              eq(inventory.lensId, body.lensId),
-              eq(inventory.branchCode, body.branchCode),
-            ),
-          );
+          if (existingReservation[0]) {
+            logInfo("inventory.reserve_rejected", {
+              request_id: requestId,
+              order_id: body.orderId,
+              lens_id: body.lensId,
+              branch_code: body.branchCode,
+              reason: "reservation_exists",
+            });
+            setHttpStatus(span, 409);
+            return status(409, {
+              error: "Inventory reservation already exists for this order",
+            });
+          }
 
-        const stock = stockRows[0];
+          const result = await db.transaction(async (tx) => {
+            const stockRows = await tx
+              .select()
+              .from(inventory)
+              .where(
+                and(
+                  eq(inventory.lensId, body.lensId),
+                  eq(inventory.branchCode, body.branchCode),
+                ),
+              );
 
-        if (!stock) {
-          logInfo("inventory.reserve_rejected", {
-            request_id: requestId,
-            order_id: body.orderId,
-            lens_id: body.lensId,
-            branch_code: body.branchCode,
-            reason: "inventory_not_found",
+            const stock = stockRows[0];
+
+            if (!stock) {
+              logInfo("inventory.reserve_rejected", {
+                request_id: requestId,
+                order_id: body.orderId,
+                lens_id: body.lensId,
+                branch_code: body.branchCode,
+                reason: "inventory_not_found",
+              });
+              setHttpStatus(span, 404);
+              return status(404, { error: "Inventory record not found" });
+            }
+
+            if (stock.availableQuantity < body.quantity) {
+              logInfo("inventory.reserve_rejected", {
+                request_id: requestId,
+                order_id: body.orderId,
+                lens_id: body.lensId,
+                branch_code: body.branchCode,
+                reason: "insufficient_stock",
+              });
+              setHttpStatus(span, 409);
+              return status(409, {
+                error: "Selected branch does not have enough stock",
+              });
+            }
+
+            const [updatedStock] = await tx
+              .update(inventory)
+              .set({
+                availableQuantity: stock.availableQuantity - body.quantity,
+              })
+              .where(eq(inventory.id, stock.id))
+              .returning();
+
+            await tx.insert(reservations).values({
+              orderId: body.orderId,
+              lensId: body.lensId,
+              branchCode: body.branchCode,
+              quantity: body.quantity,
+            });
+
+            logInfo("inventory.reserved", {
+              request_id: requestId,
+              order_id: body.orderId,
+              lens_id: body.lensId,
+              branch_code: body.branchCode,
+              quantity: body.quantity,
+              available_quantity: updatedStock?.availableQuantity ?? 0,
+            });
+
+            setHttpStatus(span, 200);
+            return {
+              success: true,
+              orderId: body.orderId,
+              lensId: body.lensId,
+              branchCode: body.branchCode,
+              quantity: body.quantity,
+              availableQuantity: updatedStock?.availableQuantity ?? 0,
+            };
           });
-          return status(404, { error: "Inventory record not found" });
+
+          return result;
+        } catch (error) {
+          setHttpStatus(span, 500);
+          recordException(span, error);
+          throw error;
+        } finally {
+          span.end();
         }
-
-        if (stock.availableQuantity < body.quantity) {
-          logInfo("inventory.reserve_rejected", {
-            request_id: requestId,
-            order_id: body.orderId,
-            lens_id: body.lensId,
-            branch_code: body.branchCode,
-            reason: "insufficient_stock",
-          });
-          return status(409, {
-            error: "Selected branch does not have enough stock",
-          });
-        }
-
-        const [updatedStock] = await tx
-          .update(inventory)
-          .set({
-            availableQuantity: stock.availableQuantity - body.quantity,
-          })
-          .where(eq(inventory.id, stock.id))
-          .returning();
-
-        await tx.insert(reservations).values({
-          orderId: body.orderId,
-          lensId: body.lensId,
-          branchCode: body.branchCode,
-          quantity: body.quantity,
-        });
-
-        logInfo("inventory.reserved", {
-          request_id: requestId,
-          order_id: body.orderId,
-          lens_id: body.lensId,
-          branch_code: body.branchCode,
-          quantity: body.quantity,
-          available_quantity: updatedStock?.availableQuantity ?? 0,
-        });
-
-        return {
-          success: true,
-          orderId: body.orderId,
-          lensId: body.lensId,
-          branchCode: body.branchCode,
-          quantity: body.quantity,
-          availableQuantity: updatedStock?.availableQuantity ?? 0,
-        };
       });
     },
     {

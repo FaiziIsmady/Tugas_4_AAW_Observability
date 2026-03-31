@@ -8,6 +8,8 @@ import { publishEvent } from "./events";
 import { releaseInventory, reserveInventory } from "./inventory";
 import { monitoring, recordOrderCreated, recordOrderFailed } from "./metrics";
 import { logError, logInfo, logWarn } from "./logger";
+import { SpanKind } from "@opentelemetry/api";
+import { injectTraceHeaders, recordException, setHttpStatus, startServerSpan, withActiveSpan, withContext } from "./tracing";
 
 const CATALOG_SERVICE_URL =
   process.env.CATALOG_SERVICE_URL || "http://localhost:3001";
@@ -145,116 +147,165 @@ const app = new Elysia()
     "/api/orders",
     async ({ body, status, request }) => {
       const requestId = requestIds.get(request) || crypto.randomUUID();
-      const lensResponse = await fetch(
-        `${CATALOG_SERVICE_URL}/api/lenses/${body.lensId}`,
-        {
-          headers: {
-            "x-request-id": requestId,
-          },
-        },
-      );
-
-      if (!lensResponse.ok) {
-        recordOrderFailed("lens_not_found");
-        logWarn("order.create_failed", {
-          request_id: requestId,
-          reason: "lens_not_found",
-          lens_id: body.lensId,
-        });
-        return status(404, { error: "Lens not found" });
-      }
-
-      const lens = (await lensResponse.json()) as CatalogLens;
-
-      const start = new Date(body.startDate);
-      const end = new Date(body.endDate);
-      const days = Math.ceil(
-        (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24),
-      );
-
-      if (days <= 0) {
-        recordOrderFailed("invalid_date_range");
-        logWarn("order.create_failed", {
-          request_id: requestId,
-          reason: "invalid_date_range",
-          lens_id: body.lensId,
-        });
-        return status(400, { error: "End date must be after start date" });
-      }
-
-      const totalPrice = (days * parseFloat(lens.dayPrice)).toFixed(2);
-      const branchCode = body.branchCode || DEFAULT_BRANCH_CODE;
-      const quantity = 1;
-      const orderId = crypto.randomUUID();
-
-      const reservation = await reserveInventory({
-        orderId,
-        lensId: body.lensId,
-        branchCode,
-        quantity,
-      }, requestId);
-
-      if (!reservation.ok) {
-        recordOrderFailed(`inventory_${reservation.status}`);
-        logWarn("order.create_failed", {
-          request_id: requestId,
-          reason: `inventory_${reservation.status}`,
-          order_id: orderId,
-          lens_id: body.lensId,
-          branch_code: branchCode,
-        });
-        return status(reservation.status, { error: reservation.error });
-      }
-
-      const [order] = await db
-        .insert(orders)
-        .values({
-          id: orderId,
-          customerName: body.customerName,
-          customerEmail: body.customerEmail,
-          lensId: body.lensId,
-          branchCode,
-          quantity,
-          lensSnapshot: {
-            modelName: lens.modelName,
-            manufacturerName: lens.manufacturerName,
-            dayPrice: lens.dayPrice,
-          },
-          startDate: start,
-          endDate: end,
-          totalPrice,
-        })
-        .returning();
-
-      if (!order) {
-        recordOrderFailed("database_insert_failed");
-        await releaseInventory(orderId, requestId);
-        logError("order.create_failed", {
-          request_id: requestId,
-          reason: "database_insert_failed",
-          order_id: orderId,
-        });
-        return status(500, { error: "Failed to create order" });
-      }
-
-      await publishEvent("order.placed", {
-        orderId: order.id,
-        customerName: body.customerName,
-        customerEmail: body.customerEmail,
-        lensName: lens.modelName,
-        branchCode,
-        quantity,
-      }, requestId);
-
-      recordOrderCreated(branchCode);
-      logInfo("order.created", {
-        request_id: requestId,
-        order_id: order.id,
-        lens_id: body.lensId,
-        branch_code: branchCode,
-        customer_email: body.customerEmail,
+      const { span, ctx } = startServerSpan(request, "POST /api/orders", {
+        "http.method": "POST",
+        "http.route": "/api/orders",
+        "app.request_id": requestId,
       });
-      return status(201, serializeOrder(order));
+
+      return await withContext(ctx, async () => {
+        try {
+          const lensResponse = await withActiveSpan(
+            "catalog-service GET /api/lenses/:id",
+            {
+              kind: SpanKind.CLIENT,
+              attributes: {
+                "http.method": "GET",
+                "http.url": `${CATALOG_SERVICE_URL}/api/lenses/${body.lensId}`,
+              },
+            },
+            async (catalogSpan) => {
+              const response = await fetch(
+                `${CATALOG_SERVICE_URL}/api/lenses/${body.lensId}`,
+                {
+                  headers: injectTraceHeaders({
+                    "x-request-id": requestId,
+                  }),
+                },
+              );
+              setHttpStatus(catalogSpan, response.status);
+              return response;
+            },
+          );
+
+          if (!lensResponse.ok) {
+            recordOrderFailed("lens_not_found");
+            setHttpStatus(span, 404);
+            logWarn("order.create_failed", {
+              request_id: requestId,
+              reason: "lens_not_found",
+              lens_id: body.lensId,
+            });
+            return status(404, { error: "Lens not found" });
+          }
+
+          const lens = (await lensResponse.json()) as CatalogLens;
+
+          const start = new Date(body.startDate);
+          const end = new Date(body.endDate);
+          const days = Math.ceil(
+            (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24),
+          );
+
+          if (days <= 0) {
+            recordOrderFailed("invalid_date_range");
+            setHttpStatus(span, 400);
+            logWarn("order.create_failed", {
+              request_id: requestId,
+              reason: "invalid_date_range",
+              lens_id: body.lensId,
+            });
+            return status(400, { error: "End date must be after start date" });
+          }
+
+          const totalPrice = (days * parseFloat(lens.dayPrice)).toFixed(2);
+          const branchCode = body.branchCode || DEFAULT_BRANCH_CODE;
+          const quantity = 1;
+          const orderId = crypto.randomUUID();
+
+          const reservation = await reserveInventory(
+            {
+              orderId,
+              lensId: body.lensId,
+              branchCode,
+              quantity,
+            },
+            requestId,
+          );
+
+          if (!reservation.ok) {
+            recordOrderFailed(`inventory_${reservation.status}`);
+            setHttpStatus(span, reservation.status);
+            logWarn("order.create_failed", {
+              request_id: requestId,
+              reason: `inventory_${reservation.status}`,
+              order_id: orderId,
+              lens_id: body.lensId,
+              branch_code: branchCode,
+            });
+            return status(reservation.status, { error: reservation.error });
+          }
+
+          const [order] = await withActiveSpan(
+            "db insert order",
+            {
+              kind: SpanKind.INTERNAL,
+            },
+            async () =>
+              await db
+                .insert(orders)
+                .values({
+                  id: orderId,
+                  customerName: body.customerName,
+                  customerEmail: body.customerEmail,
+                  lensId: body.lensId,
+                  branchCode,
+                  quantity,
+                  lensSnapshot: {
+                    modelName: lens.modelName,
+                    manufacturerName: lens.manufacturerName,
+                    dayPrice: lens.dayPrice,
+                  },
+                  startDate: start,
+                  endDate: end,
+                  totalPrice,
+                })
+                .returning(),
+          );
+
+          if (!order) {
+            recordOrderFailed("database_insert_failed");
+            await releaseInventory(orderId, requestId);
+            setHttpStatus(span, 500);
+            logError("order.create_failed", {
+              request_id: requestId,
+              reason: "database_insert_failed",
+              order_id: orderId,
+            });
+            return status(500, { error: "Failed to create order" });
+          }
+
+          await publishEvent(
+            "order.placed",
+            {
+              orderId: order.id,
+              customerName: body.customerName,
+              customerEmail: body.customerEmail,
+              lensName: lens.modelName,
+              branchCode,
+              quantity,
+            },
+            requestId,
+          );
+
+          recordOrderCreated(branchCode);
+          setHttpStatus(span, 201);
+          logInfo("order.created", {
+            request_id: requestId,
+            order_id: order.id,
+            lens_id: body.lensId,
+            branch_code: branchCode,
+            customer_email: body.customerEmail,
+          });
+          return status(201, serializeOrder(order));
+        } catch (error) {
+          setHttpStatus(span, 500);
+          recordException(span, error);
+          throw error;
+        } finally {
+          span.end();
+        }
+      });
     },
     {
       detail: {
