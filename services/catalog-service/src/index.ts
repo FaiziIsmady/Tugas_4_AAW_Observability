@@ -4,6 +4,7 @@ import { swagger } from "@elysiajs/swagger";
 import { db } from "./db";
 import { lenses } from "./db/schema";
 import { eq } from "drizzle-orm";
+import { monitoring } from "./metrics";
 
 const lensResponse = t.Object({
   id: t.String({ format: "uuid" }),
@@ -32,6 +33,34 @@ function serializeLens(lens: typeof lenses.$inferSelect) {
 }
 
 const app = new Elysia()
+  .onRequest(({ request }) => {
+    const pathname = new URL(request.url).pathname;
+    if (pathname !== "/metrics") {
+      monitoring.markRequestStart(request);
+    }
+  })
+  .onAfterHandle(({ request, path, set }) => {
+    const route = path || new URL(request.url).pathname;
+    if (route === "/metrics") return;
+
+    monitoring.recordHttpRequest({
+      request,
+      method: request.method,
+      route,
+      statusCode: typeof set.status === "number" ? set.status : 200,
+    });
+  })
+  .onError(({ request, path, set }) => {
+    const route = path || new URL(request.url).pathname;
+    if (route === "/metrics") return;
+
+    monitoring.recordHttpRequest({
+      request,
+      method: request.method,
+      route,
+      statusCode: typeof set.status === "number" ? set.status : 500,
+    });
+  })
   .use(cors())
   .use(
     swagger({
@@ -70,9 +99,11 @@ const app = new Elysia()
         .select()
         .from(lenses)
         .where(eq(lenses.id, params.id));
+
       if (!results[0]) {
         return status(404, { error: "Lens not found" });
       }
+
       return serializeLens(results[0]);
     },
     {
@@ -106,6 +137,12 @@ const app = new Elysia()
       },
     },
   )
+  .get("/metrics", async ({ set }) => {
+    set.headers = {
+      "content-type": monitoring.metricsContentType,
+    };
+    return await monitoring.register.metrics();
+  })
   .listen(3001);
 
 console.log(`Catalog Service running on port ${app.server?.port}`);

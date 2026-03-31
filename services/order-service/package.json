@@ -17,6 +17,7 @@
     "amqplib": "^0.10.9",
     "drizzle-orm": "^0.45.1",
     "elysia": "^1.4.25",
-    "postgres": "^3.4.8"
+    "postgres": "^3.4.8",
+    "prom-client": "^15.1.3"
   }
 }

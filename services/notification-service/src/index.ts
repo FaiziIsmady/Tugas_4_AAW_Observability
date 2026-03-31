@@ -6,6 +6,7 @@ import { db } from "./db";
 import { notifications } from "./db/schema";
 import { desc } from "drizzle-orm";
 import { addClient, removeClient } from "./realtime";
+import { monitoring } from "./metrics";
 
 const notificationPayload = t.Object({
   orderId: t.String({ format: "uuid" }),
@@ -42,6 +43,34 @@ function serializeNotification(notification: typeof notifications.$inferSelect) 
 }
 
 const app = new Elysia()
+  .onRequest(({ request }) => {
+    const pathname = new URL(request.url).pathname;
+    if (pathname !== "/metrics") {
+      monitoring.markRequestStart(request);
+    }
+  })
+  .onAfterHandle(({ request, path, set }) => {
+    const route = path || new URL(request.url).pathname;
+    if (route === "/metrics") return;
+
+    monitoring.recordHttpRequest({
+      request,
+      method: request.method,
+      route,
+      statusCode: typeof set.status === "number" ? set.status : 200,
+    });
+  })
+  .onError(({ request, path, set }) => {
+    const route = path || new URL(request.url).pathname;
+    if (route === "/metrics") return;
+
+    monitoring.recordHttpRequest({
+      request,
+      method: request.method,
+      route,
+      statusCode: typeof set.status === "number" ? set.status : 500,
+    });
+  })
   .use(cors())
   .use(
     swagger({
@@ -117,6 +146,12 @@ const app = new Elysia()
       },
     },
   )
+  .get("/metrics", async ({ set }) => {
+    set.headers = {
+      "content-type": monitoring.metricsContentType,
+    };
+    return await monitoring.register.metrics();
+  })
   .listen(3003);
 
 startConsumer().catch(console.error);

@@ -4,6 +4,7 @@ import { swagger } from "@elysiajs/swagger";
 import { and, eq } from "drizzle-orm";
 import { db } from "./db";
 import { branches, inventory, reservations } from "./db/schema";
+import { monitoring } from "./metrics";
 
 const branchResponse = t.Object({
   code: t.String(),
@@ -42,6 +43,34 @@ const errorResponse = t.Object({
 });
 
 const app = new Elysia()
+  .onRequest(({ request }) => {
+    const pathname = new URL(request.url).pathname;
+    if (pathname !== "/metrics") {
+      monitoring.markRequestStart(request);
+    }
+  })
+  .onAfterHandle(({ request, path, set }) => {
+    const route = path || new URL(request.url).pathname;
+    if (route === "/metrics") return;
+
+    monitoring.recordHttpRequest({
+      request,
+      method: request.method,
+      route,
+      statusCode: typeof set.status === "number" ? set.status : 200,
+    });
+  })
+  .onError(({ request, path, set }) => {
+    const route = path || new URL(request.url).pathname;
+    if (route === "/metrics") return;
+
+    monitoring.recordHttpRequest({
+      request,
+      method: request.method,
+      route,
+      statusCode: typeof set.status === "number" ? set.status : 500,
+    });
+  })
   .use(cors())
   .use(
     swagger({
@@ -287,6 +316,12 @@ const app = new Elysia()
       },
     },
   )
+  .get("/metrics", async ({ set }) => {
+    set.headers = {
+      "content-type": monitoring.metricsContentType,
+    };
+    return await monitoring.register.metrics();
+  })
   .listen(3004);
 
 console.log(`Inventory Service running on port ${app.server?.port}`);

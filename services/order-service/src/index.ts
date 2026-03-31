@@ -6,6 +6,7 @@ import { orders } from "./db/schema";
 import { eq } from "drizzle-orm";
 import { publishEvent } from "./events";
 import { releaseInventory, reserveInventory } from "./inventory";
+import { monitoring, recordOrderCreated, recordOrderFailed } from "./metrics";
 
 const CATALOG_SERVICE_URL =
   process.env.CATALOG_SERVICE_URL || "http://localhost:3001";
@@ -58,6 +59,34 @@ function serializeOrder(order: typeof orders.$inferSelect) {
 }
 
 const app = new Elysia()
+  .onRequest(({ request }) => {
+    const pathname = new URL(request.url).pathname;
+    if (pathname !== "/metrics") {
+      monitoring.markRequestStart(request);
+    }
+  })
+  .onAfterHandle(({ request, path, set }) => {
+    const route = path || new URL(request.url).pathname;
+    if (route === "/metrics") return;
+
+    monitoring.recordHttpRequest({
+      request,
+      method: request.method,
+      route,
+      statusCode: typeof set.status === "number" ? set.status : 200,
+    });
+  })
+  .onError(({ request, path, set }) => {
+    const route = path || new URL(request.url).pathname;
+    if (route === "/metrics") return;
+
+    monitoring.recordHttpRequest({
+      request,
+      method: request.method,
+      route,
+      statusCode: typeof set.status === "number" ? set.status : 500,
+    });
+  })
   .use(cors())
   .use(
     swagger({
@@ -78,9 +107,12 @@ const app = new Elysia()
       const lensResponse = await fetch(
         `${CATALOG_SERVICE_URL}/api/lenses/${body.lensId}`,
       );
+
       if (!lensResponse.ok) {
+        recordOrderFailed("lens_not_found");
         return status(404, { error: "Lens not found" });
       }
+
       const lens = (await lensResponse.json()) as CatalogLens;
 
       const start = new Date(body.startDate);
@@ -88,9 +120,12 @@ const app = new Elysia()
       const days = Math.ceil(
         (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24),
       );
+
       if (days <= 0) {
+        recordOrderFailed("invalid_date_range");
         return status(400, { error: "End date must be after start date" });
       }
+
       const totalPrice = (days * parseFloat(lens.dayPrice)).toFixed(2);
       const branchCode = body.branchCode || DEFAULT_BRANCH_CODE;
       const quantity = 1;
@@ -104,6 +139,7 @@ const app = new Elysia()
       });
 
       if (!reservation.ok) {
+        recordOrderFailed(`inventory_${reservation.status}`);
         return status(reservation.status, { error: reservation.error });
       }
 
@@ -126,7 +162,9 @@ const app = new Elysia()
           totalPrice,
         })
         .returning();
+
       if (!order) {
+        recordOrderFailed("database_insert_failed");
         await releaseInventory(orderId);
         return status(500, { error: "Failed to create order" });
       }
@@ -140,6 +178,7 @@ const app = new Elysia()
         quantity,
       });
 
+      recordOrderCreated(branchCode);
       return status(201, serializeOrder(order));
     },
     {
@@ -189,9 +228,11 @@ const app = new Elysia()
         .select()
         .from(orders)
         .where(eq(orders.id, params.id));
+
       if (!results[0]) {
         return status(404, { error: "Order not found" });
       }
+
       return serializeOrder(results[0]);
     },
     {
@@ -224,6 +265,12 @@ const app = new Elysia()
       },
     },
   )
+  .get("/metrics", async ({ set }) => {
+    set.headers = {
+      "content-type": monitoring.metricsContentType,
+    };
+    return await monitoring.register.metrics();
+  })
   .listen(3002);
 
 console.log(`Order Service running on port ${app.server?.port}`);

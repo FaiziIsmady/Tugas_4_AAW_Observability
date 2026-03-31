@@ -141,6 +141,28 @@ services:
       VITE_NOTIFICATION_API: http://localhost:3003
       VITE_NOTIFICATION_WS: ws://localhost:3003/ws/notifications
 
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - catalog-service
+      - order-service
+      - inventory-service
+      - notification-service
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    ports:
+      - "3005:3000"
+    volumes:
+      - ./observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus
+
 volumes:
   catalog_pgdata:
   inventory_pgdata:
